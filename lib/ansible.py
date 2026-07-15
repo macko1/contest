@@ -3,21 +3,21 @@ import sys
 import re
 import contextlib
 import subprocess
+import tempfile
 
 from lib import util, results, versions
 
-# Versions pinned to match what rhc-worker-playbook bundles on RHEL for the
-# given RHEL version, so that CentOS/Fedora test environments are as close
-# as possible to RHEL.
-# RHEL 8/9 (rhc-worker-playbook 0.1.x):
-#   https://gitlab.com/redhat/centos-stream/rpms/rhc-worker-playbook/-/blob/c9s/rhc-worker-playbook.spec
-# RHEL 10  (rhc-worker-playbook 0.2.x):
-#   https://github.com/RedHatInsights/rhc-worker-playbook/blob/main/ansible/meson.build
+_GALAXY_ARTIFACTS = 'https://galaxy.ansible.com/api/v3/plugin/ansible/content/published/collections/artifacts'
+
+# Versions pinned to match what rhc-worker-playbook bundles on RHEL, so that
+# CentOS/Fedora test environments stay as close to RHEL as possible.
+# Update when rhc-worker-playbook bumps its collection versions:
+#   RHEL 8/9: https://gitlab.com/redhat/centos-stream/rpms/rhc-worker-playbook/-/blob/c9s/rhc-worker-playbook.spec
+#   RHEL 10:  https://github.com/RedHatInsights/rhc-worker-playbook/blob/main/ansible/meson.build
 ANSIBLE_GALAXY_COLLECTIONS = {
     8: ['ansible.posix:1.3.0', 'community.general:4.4.0'],
     9: ['ansible.posix:1.3.0', 'community.general:4.4.0'],
     10: ['ansible.posix:1.5.4', 'community.general:9.2.0'],
-    'default': ['ansible.posix', 'community.general'],
 }
 
 
@@ -31,16 +31,37 @@ def install_deps():
         os.environ['ANSIBLE_COLLECTIONS_PATH'] = \
             '/usr/share/rhc-worker-playbook/ansible/collections/ansible_collections/'
     else:
-        collections = ANSIBLE_GALAXY_COLLECTIONS.get(
-            versions.rhel.major, ANSIBLE_GALAXY_COLLECTIONS['default'],
-        )
-        util.subprocess_run(
-            (
-                'ansible-galaxy', '-vvv', 'collection', 'install', '--force', *collections,
-            ),
-            check=True,
-            stderr=subprocess.PIPE,
-        )
+        collections = ANSIBLE_GALAXY_COLLECTIONS.get(versions.rhel.major)
+        if not collections:
+            return
+        if versions.rhel.major == 9:
+            # CS9 only: OpenSSL 3.0.21+ (shipped 2026-07) breaks Python SSL, causing
+            # ansible-galaxy to fail with [ASN1: NOT_ENOUGH_DATA] (cpython/issues#151504).
+            # Download tarballs using curl (libcurl, unaffected) and install from local paths.
+            # Remove this branch when python3.9-3.9.25-8.el9 ships to CS9 (RHEL-191730).
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tarballs = []
+                for coll in collections:
+                    name, _, version = coll.partition(':')
+                    namespace, coll_name = name.split('.', 1)
+                    tarball = f'{namespace}-{coll_name}-{version}.tar.gz'
+                    dest = os.path.join(tmpdir, tarball)
+                    util.subprocess_run(
+                        ['curl', '-fsSL', '-o', dest, f'{_GALAXY_ARTIFACTS}/{tarball}'],
+                        check=True,
+                    )
+                    tarballs.append(dest)
+                util.subprocess_run(
+                    ['ansible-galaxy', '-vvv', 'collection', 'install', '--force', *tarballs],
+                    check=True,
+                    stderr=subprocess.PIPE,
+                )
+        else:
+            util.subprocess_run(
+                ['ansible-galaxy', '-vvv', 'collection', 'install', '--force', *collections],
+                check=True,
+                stderr=subprocess.PIPE,
+            )
 
 
 def report_from_output(lines, to_file=None, failure='fail'):
